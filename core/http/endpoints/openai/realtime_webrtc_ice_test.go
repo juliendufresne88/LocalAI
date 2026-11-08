@@ -27,6 +27,26 @@ var _ = Describe("webRTC ICE settings", func() {
 			Expect(f("docker0")).To(BeFalse())
 			Expect(f("veth123")).To(BeFalse())
 		})
+
+		It("trims whitespace and ignores blank names", func() {
+			f := iceInterfaceFilter([]string{" eth0 ", " ", ""})
+			Expect(f).NotTo(BeNil())
+			Expect(f("eth0")).To(BeTrue())
+			Expect(f(" eth0 ")).To(BeFalse())
+		})
+	})
+
+	Describe("iceAllowListIncludesLoopback", func() {
+		It("stays off unless a named interface is actually loopback", func() {
+			Expect(iceAllowListIncludesLoopback(nil)).To(BeFalse())
+			Expect(iceAllowListIncludesLoopback([]string{})).To(BeFalse())
+			Expect(iceAllowListIncludesLoopback([]string{" ", "localai-no-such-interface"})).To(BeFalse())
+			lo := loopbackInterfaceName()
+			Expect(iceAllowListIncludesLoopback([]string{" " + lo + " "})).To(BeTrue())
+			if physical := physicalInterfaceName(); physical != "" {
+				Expect(iceAllowListIncludesLoopback([]string{physical})).To(BeFalse())
+			}
+		})
 	})
 
 	Describe("webRTCSettingEngine", func() {
@@ -85,6 +105,73 @@ var _ = Describe("webRTC ICE settings", func() {
 			Expect(err).To(MatchError(ContainSubstring("localai-no-such-interface")))
 		})
 
+		It("keeps loopback out of the default gather and out of a physical-interface allow-list", func() {
+			engine, err := webRTCSettingEngine(nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(loopbackIPs(gatheredHostIPs(engine))).To(BeEmpty())
+
+			engine, err = webRTCSettingEngine(&config.ApplicationConfig{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(loopbackIPs(gatheredHostIPs(engine))).To(BeEmpty())
+
+			physical := physicalInterfaceName()
+			if physical == "" {
+				Skip("needs an up non-loopback interface with an IPv4 address")
+			}
+			engine, err = webRTCSettingEngine(&config.ApplicationConfig{
+				WebRTCICEInterfaces: []string{physical},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			gathered := gatheredHostIPs(engine)
+			Expect(gathered).NotTo(BeEmpty())
+			Expect(loopbackIPs(gathered)).To(BeEmpty())
+			Expect(gathered).To(ConsistOf(ipsOfInterface(physical)))
+		})
+
+		// Pion applies the loopback exclusion before the interface filter, so the
+		// allow-list by itself cannot observe lo/lo0. NAT 1:1 only rewrites
+		// candidates that gathering already produced.
+		It("does not gather loopback from the interface filter or from NAT 1:1 alone", func() {
+			lo := loopbackInterfaceName()
+			bare := webrtc.SettingEngine{}
+			bare.SetInterfaceFilter(func(name string) bool { return name == lo })
+			Expect(gatheredHostIPs(bare)).To(BeEmpty())
+
+			engine, err := webRTCSettingEngine(&config.ApplicationConfig{
+				WebRTCNAT1To1IPs:    []string{"127.0.0.1"},
+				WebRTCICEInterfaces: []string{"localai-no-such-interface"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(gatheredHostIPs(engine)).To(BeEmpty())
+		})
+
+		It("gathers only loopback host candidates when the allow-list names loopback", func() {
+			lo := loopbackInterfaceName()
+			engine, err := webRTCSettingEngine(&config.ApplicationConfig{
+				WebRTCICEInterfaces: []string{lo},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			gathered := gatheredHostIPs(engine)
+			Expect(gathered).To(ContainElement("127.0.0.1"))
+			Expect(loopbackIPs(gathered)).To(Equal(gathered))
+			if physical := physicalInterfaceName(); physical != "" {
+				for _, ip := range ipsOfInterface(physical) {
+					Expect(gathered).NotTo(ContainElement(ip))
+				}
+			}
+		})
+
+		It("gathers a loopback host candidate when a UDP port is pinned to loopback", func() {
+			lo := loopbackInterfaceName()
+			engine, err := webRTCSettingEngine(&config.ApplicationConfig{
+				WebRTCICEInterfaces: []string{lo},
+				WebRTCUDPPort:       freeUDPPort(),
+			})
+			Expect(err).NotTo(HaveOccurred())
+			gathered := gatheredHostIPs(engine)
+			Expect(gathered).To(ConsistOf("127.0.0.1"))
+		})
+
 		It("gathers host candidates only on allowed interfaces when a UDP port is pinned", func() {
 			allowed, others := splitLocalInterfaces()
 			if allowed == "" || len(others) == 0 {
@@ -117,6 +204,49 @@ func freeUDPPort() int {
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	Expect(conn.Close()).To(Succeed())
 	return port
+}
+
+// loopbackInterfaceName returns the up loopback interface (lo, or lo0 on macOS).
+func loopbackInterfaceName() string {
+	ifaces, err := net.Interfaces()
+	Expect(err).NotTo(HaveOccurred())
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback == 0 {
+			continue
+		}
+		if len(ipsOfInterface(iface.Name)) > 0 {
+			return iface.Name
+		}
+	}
+	Skip("needs an up loopback interface with an IPv4 address")
+	return ""
+}
+
+// physicalInterfaceName returns one up non-loopback interface with an IPv4
+// address, or "" when this host has none.
+func physicalInterfaceName() string {
+	ifaces, err := net.Interfaces()
+	Expect(err).NotTo(HaveOccurred())
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if len(ipsOfInterface(iface.Name)) > 0 {
+			return iface.Name
+		}
+	}
+	return ""
+}
+
+func loopbackIPs(ips []string) []string {
+	var out []string
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip)
+		if parsed != nil && parsed.IsLoopback() {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 // splitLocalInterfaces returns one interface to allow plus every other

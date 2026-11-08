@@ -39,7 +39,10 @@ type ApplicationConfig struct {
 	// networking (where pion also offers unreachable bridge IPs) or NAT.
 	WebRTCNAT1To1IPs []string
 	// WebRTCICEInterfaces, when set, restricts ICE candidate gathering to these
-	// network interfaces (e.g. eth0), filtering out docker0/veth noise.
+	// network interfaces (e.g. eth0), filtering out docker0/veth noise. Naming a
+	// loopback interface (lo0 on macOS, lo on Linux) also gathers loopback
+	// candidates. Pion omits those unless asked, so an allow-list of only the
+	// loopback interface would otherwise advertise nothing.
 	WebRTCICEInterfaces []string
 	// WebRTCUDPPort, when positive, is the shared UDP port used by all WebRTC
 	// peer connections. Zero keeps pion's default ephemeral-port behavior.

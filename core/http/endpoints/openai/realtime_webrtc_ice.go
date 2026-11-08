@@ -2,6 +2,8 @@ package openai
 
 import (
 	"fmt"
+	"net"
+	"strings"
 
 	"github.com/mudler/LocalAI/core/config"
 	"github.com/mudler/xlog"
@@ -12,15 +14,28 @@ import (
 // webRTCSettingEngine builds the pion SettingEngine for /v1/realtime WebRTC.
 //
 // With a default (empty) SettingEngine, pion gathers a host ICE candidate for
-// every local interface. Under Docker host networking that includes bridge
-// addresses (docker0/veth, 172.x) that a remote browser cannot route to; the
-// connection often establishes on a good pair and then drops once ICE consent
-// checks fail on the unreachable ones. The two opt-in knobs below let an
-// operator advertise only the reachable address.
+// every local interface except loopback. Under Docker host networking that
+// includes bridge addresses (docker0/veth, 172.x) that a remote browser cannot
+// route to; the connection often establishes on a good pair and then drops
+// once ICE consent checks fail on the unreachable ones. The opt-in knobs below
+// let an operator advertise only the reachable address.
+//
+// Loopback is a separate switch from the interface allow-list. Pion discards
+// FlagLoopback addresses before the allow-list runs, so naming lo0 or lo and
+// nothing else gathers zero candidates, the SDP answer still returns 201, and
+// the browser then closes the transport. That is the same-machine path with
+// the radio off: the page is on 127.0.0.1 and the LAN address is gone. Include
+// loopback only when the operator named a loopback interface. An empty
+// allow-list and a LAN-only list stay on pion's default.
 func webRTCSettingEngine(cfg *config.ApplicationConfig) (webrtc.SettingEngine, error) {
 	s := webrtc.SettingEngine{}
 	if cfg == nil {
 		return s, nil
+	}
+	includeLoopback := iceAllowListIncludesLoopback(cfg.WebRTCICEInterfaces)
+	if includeLoopback {
+		s.SetIncludeLoopbackCandidate(true)
+		xlog.Info("realtime webrtc: including loopback ICE candidates", "interfaces", cfg.WebRTCICEInterfaces)
 	}
 	if len(cfg.WebRTCNAT1To1IPs) > 0 {
 		s.SetNAT1To1IPs(cfg.WebRTCNAT1To1IPs, webrtc.ICECandidateTypeHost)
@@ -31,7 +46,7 @@ func webRTCSettingEngine(cfg *config.ApplicationConfig) (webrtc.SettingEngine, e
 		xlog.Debug("realtime webrtc: restricting ICE interfaces", "interfaces", cfg.WebRTCICEInterfaces)
 	}
 	if cfg.WebRTCUDPPort > 0 {
-		mux, err := udpMuxOnPort(cfg.WebRTCUDPPort, cfg.WebRTCICEInterfaces)
+		mux, err := udpMuxOnPort(cfg.WebRTCUDPPort, cfg.WebRTCICEInterfaces, includeLoopback)
 		if err != nil {
 			return s, err
 		}
@@ -50,11 +65,16 @@ func webRTCSettingEngine(cfg *config.ApplicationConfig) (webrtc.SettingEngine, e
 // never consults SetInterfaceFilter. A wildcard socket therefore silently
 // discards WebRTCICEInterfaces and re-advertises exactly the docker0/veth
 // addresses that setting exists to suppress.
-func udpMuxOnPort(port int, interfaces []string) (ice.UDPMux, error) {
+func udpMuxOnPort(port int, interfaces []string, includeLoopback bool) (ice.UDPMux, error) {
 	// UDP4 only, matching the socket family this replaces.
 	opts := []ice.UDPMuxFromPortOption{ice.UDPMuxFromPortWithNetworks(ice.NetworkTypeUDP4)}
 	if filter := iceInterfaceFilter(interfaces); filter != nil {
 		opts = append(opts, ice.UDPMuxFromPortWithInterfaceFilter(filter))
+	}
+	// The mux enumerates interfaces on its own, with loopback off unless asked.
+	// An allow-list of only lo0 would otherwise bind nothing and fail the call.
+	if includeLoopback {
+		opts = append(opts, ice.UDPMuxFromPortWithLoopback())
 	}
 
 	mux, err := ice.NewMultiUDPMuxFromPort(port, opts...)
@@ -76,15 +96,40 @@ func udpMuxOnPort(port int, interfaces []string) (ice.UDPMux, error) {
 // iceInterfaceFilter returns an interface allow-list predicate for pion, or nil
 // when no interfaces are configured (pion's default: gather from all).
 func iceInterfaceFilter(allowed []string) func(string) bool {
-	if len(allowed) == 0 {
+	set := iceInterfaceSet(allowed)
+	if len(set) == 0 {
 		return nil
-	}
-	set := make(map[string]struct{}, len(allowed))
-	for _, name := range allowed {
-		set[name] = struct{}{}
 	}
 	return func(iface string) bool {
 		_, ok := set[iface]
 		return ok
 	}
+}
+
+// iceAllowListIncludesLoopback reports whether the operator named an interface
+// that carries the loopback flag. The name is whatever the host uses (lo0 on
+// macOS, lo on Linux); the flag, not the spelling, is what pion rejects.
+func iceAllowListIncludesLoopback(allowed []string) bool {
+	for name := range iceInterfaceSet(allowed) {
+		iface, err := net.InterfaceByName(name)
+		if err != nil {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func iceInterfaceSet(allowed []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		set[name] = struct{}{}
+	}
+	return set
 }
