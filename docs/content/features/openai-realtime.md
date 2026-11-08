@@ -528,7 +528,8 @@ The opus backend is loaded automatically when a WebRTC session starts. It does n
 
 #### WebRTC behind Docker host networking or NAT
 
-By default pion gathers a host ICE candidate for every local interface. Under
+By default pion gathers a host ICE candidate for every local interface except
+loopback. Under
 Docker **host networking** that includes bridge addresses (`docker0`/`veth`,
 `172.x`) that a remote browser cannot route to: the call typically connects on a
 good candidate and then drops a few seconds later when ICE consent checks fail on
@@ -547,6 +548,42 @@ For a browser on another LAN machine talking to LocalAI in a host-networked
 container, set `LOCALAI_WEBRTC_NAT_1TO1_IPS` to the host's LAN IP. This is the
 most reliable fix for WebRTC connections that establish and then drop.
 {{% /notice %}}
+
+#### Same machine, no physical network
+
+Pion does not gather loopback addresses unless it is asked to. Putting only
+`lo0` or `lo` in `LOCALAI_WEBRTC_ICE_INTERFACES` used to leave that switch off,
+so the answer carried no ICE candidates: `POST /v1/realtime/calls` still
+returned 201 and the browser then closed the transport. An empty allow-list,
+or a list of only a physical interface such as `en0` or `eth0`, still omits
+loopback. That keeps a remote browser on the LAN from being offered `127.0.0.1`.
+
+For Talk in a browser on this same machine when Wi-Fi and Ethernet are down,
+name the loopback interface. LocalAI then gathers `127.0.0.1` (and `::1` when
+the host has it):
+
+```bash
+# macOS
+LOCALAI_WEBRTC_ICE_INTERFACES=lo0
+
+# Linux
+LOCALAI_WEBRTC_ICE_INTERFACES=lo
+```
+
+Do not combine that with `LOCALAI_WEBRTC_NAT_1TO1_IPS`. NAT 1:1 rewrites
+whatever host candidates were gathered; it does not create a loopback
+candidate, and a LAN address in that list replaces `127.0.0.1`. Leave the UDP
+port unset, or set it together with the loopback interface: the shared UDP
+socket follows the same allow-list and the same loopback switch.
+
+The browser has its own loopback filter, separate from this server setting.
+Chrome and other Chromium browsers gather a `127.0.0.1` candidate only when
+started with `--allow-loopback-in-peer-connection`. Firefox gathers one only
+when `media.peerconnection.ice.loopback` is `true`. Safari uses the same
+WebRTC default of ignoring loopback and has no documented switch for it. This
+server setting does not change the browser. A WebSocket realtime session on
+`127.0.0.1` is a different transport and does not show that Talk's WebRTC
+media path is up.
 
 #### Fixed WebRTC UDP port
 
