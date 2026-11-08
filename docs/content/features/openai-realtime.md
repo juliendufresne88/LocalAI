@@ -576,14 +576,21 @@ candidate, and a LAN address in that list replaces `127.0.0.1`. Leave the UDP
 port unset, or set it together with the loopback interface: the shared UDP
 socket follows the same allow-list and the same loopback switch.
 
-The browser has its own loopback filter, separate from this server setting.
-Chrome and other Chromium browsers gather a `127.0.0.1` candidate only when
-started with `--allow-loopback-in-peer-connection`. Firefox gathers one only
-when `media.peerconnection.ice.loopback` is `true`. Safari uses the same
-WebRTC default of ignoring loopback and has no documented switch for it. This
-server setting does not change the browser. A WebSocket realtime session on
-`127.0.0.1` is a different transport and does not show that Talk's WebRTC
-media path is up.
+The browser gathers its own candidates separately from this server setting.
+Chromium leaves local loopback interfaces out of that list unless it is
+started with `--allow-loopback-in-peer-connection`
+([`kDefaultNetworkIgnoreMask`](https://chromium.googlesource.com/external/webrtc/+/master/rtc_base/network.h)
+includes `ADAPTER_TYPE_LOOPBACK`). That is a statement about what the browser
+advertises, not a test that the flag is required for every call. A connectivity
+check that arrives at the server's `127.0.0.1` candidate can still be learned
+as a peer-reflexive candidate when the browser has some local UDP socket to
+send it from. If the browser gathers no local candidate at all, it cannot send
+that check. Firefox's `media.peerconnection.ice.loopback` preference is
+documented as gating localhost addresses for local and remote candidates; that
+preference was not exercised here. Safari uses the same WebRTC default of
+ignoring local loopback, and no equivalent switch was found. None of this was
+run in Chrome, Firefox, or Safari, and a WebSocket session on `127.0.0.1` does
+not show that Talk's WebRTC media path is up.
 
 #### Fixed WebRTC UDP port
 

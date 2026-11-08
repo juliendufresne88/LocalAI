@@ -2,6 +2,7 @@ package openai
 
 import (
 	"net"
+	"strings"
 	"time"
 
 	"github.com/mudler/LocalAI/core/config"
@@ -83,7 +84,83 @@ var _ = Describe("loopback WebRTC media", func() {
 		Eventually(gotMic, 5*time.Second).Should(Receive(Equal(micPayload)))
 		Eventually(gotTTS, 5*time.Second).Should(Receive(Equal(ttsPayload)))
 	})
+
+	// The offerer's host candidates are removed from the SDP the answerer sees.
+	// Both agents still bind loopback, so the offerer can send a check to the
+	// answerer's advertised 127.0.0.1. The answerer must learn that source as
+	// a peer-reflexive candidate. This does not start a browser, and it does
+	// not show that a browser with no local socket can connect.
+	It("learns a peer-reflexive loopback address when the offer hides its candidates", func() {
+		lo := loopbackInterfaceName()
+		cfg := &config.ApplicationConfig{WebRTCICEInterfaces: []string{lo}}
+		offerEngine, err := webRTCSettingEngine(cfg)
+		Expect(err).NotTo(HaveOccurred())
+		answerEngine, err := webRTCSettingEngine(cfg)
+		Expect(err).NotTo(HaveOccurred())
+
+		offerPC, _ := newLoopbackAudioPeer(offerEngine, "hidden-offer")
+		answerPC, _ := newLoopbackAudioPeer(answerEngine, "loopback-answer")
+		DeferCleanup(offerPC.Close)
+		DeferCleanup(answerPC.Close)
+
+		offer, err := offerPC.CreateOffer(nil)
+		Expect(err).NotTo(HaveOccurred())
+		gathered := webrtc.GatheringCompletePromise(offerPC)
+		Expect(offerPC.SetLocalDescription(offer)).To(Succeed())
+		Eventually(gathered, 10*time.Second).Should(BeClosed())
+
+		fullOffer := offerPC.LocalDescription().SDP
+		Expect(fullOffer).To(ContainSubstring("127.0.0.1"))
+		hidden := stripHostCandidates(fullOffer)
+		Expect(hidden).NotTo(ContainSubstring("a=candidate:"))
+
+		Expect(answerPC.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeOffer,
+			SDP:  hidden,
+		})).To(Succeed())
+		answer, err := answerPC.CreateAnswer(nil)
+		Expect(err).NotTo(HaveOccurred())
+		gathered = webrtc.GatheringCompletePromise(answerPC)
+		Expect(answerPC.SetLocalDescription(answer)).To(Succeed())
+		Eventually(gathered, 10*time.Second).Should(BeClosed())
+		Expect(answerPC.LocalDescription().SDP).To(ContainSubstring("127.0.0.1"))
+		Expect(offerPC.SetRemoteDescription(*answerPC.LocalDescription())).To(Succeed())
+
+		Eventually(answerPC.ConnectionState, 15*time.Second, 50*time.Millisecond).
+			Should(Equal(webrtc.PeerConnectionStateConnected))
+		Eventually(func() bool {
+			return hasLoopbackPrflx(answerPC)
+		}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
+	})
 })
+
+func stripHostCandidates(sdp string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(sdp, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "a=candidate:") {
+			continue
+		}
+		b.WriteString(line)
+		if !strings.HasSuffix(line, "\n") {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func hasLoopbackPrflx(pc *webrtc.PeerConnection) bool {
+	for _, stat := range pc.GetStats() {
+		cand, ok := stat.(webrtc.ICECandidateStats)
+		if !ok || cand.CandidateType != webrtc.ICECandidateTypePrflx {
+			continue
+		}
+		ip := net.ParseIP(cand.IP)
+		if ip != nil && ip.IsLoopback() {
+			return true
+		}
+	}
+	return false
+}
 
 func newLoopbackAudioPeer(engine webrtc.SettingEngine, streamID string) (*webrtc.PeerConnection, *webrtc.TrackLocalStaticRTP) {
 	m := &webrtc.MediaEngine{}
